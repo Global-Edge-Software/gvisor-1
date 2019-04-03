@@ -47,8 +47,8 @@ type Route struct {
 	// starts.
 	ref *referencedNetworkEndpoint
 
-	// loop controls where WritePacket should send packets.
-	loop PacketLooping
+	// Loop controls where WritePacket should send packets.
+	Loop PacketLooping
 }
 
 // makeRoute initializes a new route. It takes ownership of the provided
@@ -67,7 +67,7 @@ func makeRoute(netProto tcpip.NetworkProtocolNumber, localAddr, remoteAddr tcpip
 		LocalLinkAddress: localLinkAddr,
 		RemoteAddress:    remoteAddr,
 		ref:              ref,
-		loop:             loop,
+		Loop:             loop,
 	}
 }
 
@@ -157,7 +157,7 @@ func (r *Route) WritePacket(gso *GSO, hdr buffer.Prependable, payload buffer.Vec
 		return tcpip.ErrInvalidEndpointState
 	}
 
-	err := r.ref.ep.WritePacket(r, gso, hdr, payload, protocol, ttl, r.loop)
+	err := r.ref.ep.WritePacket(r, gso, hdr, payload, protocol, ttl, r.Loop)
 	if err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
 	} else {
@@ -174,7 +174,7 @@ func (r *Route) WriteHeaderIncludedPacket(payload buffer.VectorisedView) *tcpip.
 		return tcpip.ErrInvalidEndpointState
 	}
 
-	if err := r.ref.ep.WriteHeaderIncludedPacket(r, payload, r.loop); err != nil {
+	if err := r.ref.ep.WriteHeaderIncludedPacket(r, payload, r.Loop); err != nil {
 		r.Stats().IP.OutgoingPacketErrors.Increment()
 		return err
 	}

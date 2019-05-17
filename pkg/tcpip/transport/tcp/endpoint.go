@@ -64,7 +64,7 @@ const (
 // connected is the set of states where an endpoint is connected to a peer.
 func (s EndpointState) connected() bool {
 	switch s {
-	case StateEstablished, StateFinWait1, StateFinWait2, StateTimeWait, StateCloseWait, StateLastAck, StateClosing:
+	case StateEstablished, StateFinWait1, StateFinWait2, StateCloseWait, StateLastAck, StateClosing:
 		return true
 	default:
 		return false
@@ -117,6 +117,7 @@ const (
 	notifyMTUChanged
 	notifyDrain
 	notifyReset
+	notifyResetByPeer
 	notifyKeepaliveChanged
 	notifyMSSChanged
 )
@@ -220,7 +221,14 @@ type endpoint struct {
 	mu sync.RWMutex `state:"nosave"`
 	id stack.TransportEndpointID
 
+	// Must be read/set using the State()/setState() methods. It can freely
+	// read using State() without holding e.mu but setState() should not be
+	// invoked without holding e.mu.
 	state EndpointState `state:".(EndpointState)"`
+
+	// origEndpointState is only used during a restore phase to save the
+	// endpoint state at restore time.
+	origEndpointState EndpointState `state:"nosave"`
 
 	isPortReserved    bool `state:"manual"`
 	isRegistered      bool
@@ -249,7 +257,7 @@ type endpoint struct {
 	workerRunning bool
 
 	// workerCleanup specifies if the worker goroutine must perform cleanup
-	// before exitting. This can only be set to true when workerRunning is
+	// before exiting. This can only be set to true when workerRunning is
 	// also true, and they're both protected by the mutex.
 	workerCleanup bool
 
@@ -412,6 +420,19 @@ func (e *endpoint) ResumeWork() {
 	e.workMu.Unlock()
 }
 
+// setEndpointState() updates the state of the endpoint to state atomically.
+// Must hold e.mu when updating state. This method is unexported as
+// the only place we should update the state is in this package but
+// we allow the state to be read freely without holding e.mu.
+func (e *endpoint) setEndpointState(state EndpointState) {
+	atomic.StoreUint32((*uint32)(&e.state), uint32(state))
+}
+
+// EndpointState returns the current state of the endpoint.
+func (e *endpoint) EndpointState() EndpointState {
+	return EndpointState(atomic.LoadUint32((*uint32)(&e.state)))
+}
+
 // keepalive is a synchronization wrapper used to appease stateify. See the
 // comment in endpoint, where it is used.
 //
@@ -562,7 +583,7 @@ func (e *endpoint) Close() {
 	// are immediately available for reuse after Close() is called. If also
 	// registered, we unregister as well otherwise the next user would fail
 	// in Listen() when trying to register.
-	if e.state == StateListen && e.isPortReserved {
+	if e.EndpointState() == StateListen && e.isPortReserved {
 		if e.isRegistered {
 			e.stack.UnregisterTransportEndpoint(e.boundNICID, e.effectiveNetProtos, ProtocolNumber, e.id, e)
 			e.isRegistered = false
@@ -1151,7 +1172,7 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 				case StateEstablished:
 					e.workMu.Lock()
 					e.mu.Lock()
-					if e.state == state {
+					if e.EndpointState() == state {
 						e.snd.cc = e.snd.initCongestionControl(e.cc)
 					}
 					e.mu.Unlock()
@@ -1175,7 +1196,7 @@ func (e *endpoint) readyReceiveSize() (int, *tcpip.Error) {
 	defer e.mu.RUnlock()
 
 	// The endpoint cannot be in listen state.
-	if e.state == StateListen {
+	if e.EndpointState() == StateListen {
 		return 0, tcpip.ErrInvalidEndpointState
 	}
 
@@ -1408,7 +1429,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 		return err
 	}
 
-	if e.state.connected() {
+	if e.EndpointState().connected() {
 		// The endpoint is already connected. If caller hasn't been
 		// notified yet, return success.
 		if !e.isConnectNotified {
@@ -1420,7 +1441,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 	}
 
 	nicid := addr.NIC
-	switch e.state {
+	switch e.EndpointState() {
 	case StateBound:
 		// If we're already bound to a NIC but the caller is requesting
 		// that we use a different one now, we cannot proceed.
@@ -1509,7 +1530,7 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 	}
 
 	e.isRegistered = true
-	e.state = StateConnecting
+	e.setEndpointState(StateConnecting)
 	e.route = r.Clone()
 	e.boundNICID = nicid
 	e.effectiveNetProtos = netProtos
@@ -1530,13 +1551,13 @@ func (e *endpoint) connect(addr tcpip.FullAddress, handshake bool, run bool) (er
 		}
 		e.segmentQueue.mu.Unlock()
 		e.snd.updateMaxPayloadSize(int(e.route.MTU()), 0)
-		e.state = StateEstablished
+		//e.setEndpointState(StateEstablished)
 	}
 
 	if run {
 		e.workerRunning = true
 		e.stack.Stats().TCP.ActiveConnectionOpenings.Increment()
-		go e.protocolMainLoop(handshake) // S/R-SAFE: will be drained before save.
+		go e.protocolMainLoop(handshake, nil) // S/R-SAFE: will be drained before save.
 	}
 
 	return tcpip.ErrConnectStarted
@@ -1567,6 +1588,14 @@ func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) *tcpip.Error {
 			// If we're fully closed and we have unread data we need to abort
 			// the connection with a RST.
 			if (e.shutdownFlags&tcpip.ShutdownWrite) != 0 && rcvBufUsed > 0 {
+				// Move the socket to error state immediately so
+				// that This is done redundantly because in case
+				// of save/restore on a Close() the socket state
+				// needs to indicate the error otherwise save
+				// file will show the socket in established
+				// state even though snd/rcv are closed.
+				e.setEndpointState(StateError)
+				e.hardError = tcpip.ErrConnectionAborted
 				e.notifyProtocolGoroutine(notifyReset)
 				return nil
 			}
@@ -1592,11 +1621,13 @@ func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) *tcpip.Error {
 
 			e.sndBufMu.Unlock()
 
+			e.setEndpointState(StateFinWait1)
+
 			// Tell protocol goroutine to close.
 			e.sndCloseWaker.Assert()
 		}
 
-	case e.state == StateListen:
+	case e.EndpointState() == StateListen:
 		// Tell protocolListenLoop to stop.
 		if flags&tcpip.ShutdownRead != 0 {
 			e.notifyProtocolGoroutine(notifyClose)
@@ -1624,7 +1655,7 @@ func (e *endpoint) Listen(backlog int) (err *tcpip.Error) {
 	// When the endpoint shuts down, it sets workerCleanup to true, and from
 	// that point onward, acceptedChan is the responsibility of the cleanup()
 	// method (and should not be touched anywhere else, including here).
-	if e.state == StateListen && !e.workerCleanup {
+	if e.EndpointState() == StateListen && !e.workerCleanup {
 		// Adjust the size of the channel iff we can fix existing
 		// pending connections into the new one.
 		if len(e.acceptedChan) > backlog {
@@ -1643,7 +1674,7 @@ func (e *endpoint) Listen(backlog int) (err *tcpip.Error) {
 	}
 
 	// Endpoint must be bound before it can transition to listen mode.
-	if e.state != StateBound {
+	if e.EndpointState() != StateBound {
 		return tcpip.ErrInvalidEndpointState
 	}
 
@@ -1653,24 +1684,26 @@ func (e *endpoint) Listen(backlog int) (err *tcpip.Error) {
 	}
 
 	e.isRegistered = true
-	e.state = StateListen
+	e.setEndpointState(StateListen)
 	if e.acceptedChan == nil {
 		e.acceptedChan = make(chan *endpoint, backlog)
 	}
 	e.workerRunning = true
-
 	go e.protocolListenLoop( // S/R-SAFE: drained on save.
 		seqnum.Size(e.receiveBufferAvailable()))
-
 	return nil
 }
 
 // startAcceptedLoop sets up required state and starts a goroutine with the
 // main loop for accepted connections.
 func (e *endpoint) startAcceptedLoop(waiterQueue *waiter.Queue) {
+	e.mu.Lock()
 	e.waiterQueue = waiterQueue
 	e.workerRunning = true
-	go e.protocolMainLoop(false) // S/R-SAFE: drained on save.
+	e.mu.Unlock()
+	wakerInitDone := make(chan struct{})
+	go e.protocolMainLoop(false, wakerInitDone) // S/R-SAFE: drained on save.
+	<-wakerInitDone
 }
 
 // Accept returns a new endpoint if a peer has established a connection
@@ -1680,7 +1713,7 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	defer e.mu.RUnlock()
 
 	// Endpoint must be in listen state before it can accept connections.
-	if e.state != StateListen {
+	if e.EndpointState() != StateListen {
 		return nil, nil, tcpip.ErrInvalidEndpointState
 	}
 
@@ -1692,12 +1725,8 @@ func (e *endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 		return nil, nil, tcpip.ErrWouldBlock
 	}
 
-	// Start the protocol goroutine.
-	wq := &waiter.Queue{}
-	n.startAcceptedLoop(wq)
 	e.stack.Stats().TCP.PassiveConnectionOpenings.Increment()
-
-	return n, wq, nil
+	return n, n.waiterQueue, nil
 }
 
 // Bind binds the endpoint to a specific local port and optionally address.
@@ -1708,7 +1737,7 @@ func (e *endpoint) Bind(addr tcpip.FullAddress) (err *tcpip.Error) {
 	// Don't allow binding once endpoint is not in the initial state
 	// anymore. This is because once the endpoint goes into a connected or
 	// listen state, it is already bound.
-	if e.state != StateInitial {
+	if e.EndpointState() != StateInitial {
 		return tcpip.ErrAlreadyBound
 	}
 
@@ -1763,7 +1792,7 @@ func (e *endpoint) Bind(addr tcpip.FullAddress) (err *tcpip.Error) {
 	}
 
 	// Mark endpoint as bound.
-	e.state = StateBound
+	e.setEndpointState(StateBound)
 
 	return nil
 }
@@ -1785,7 +1814,7 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	if !e.state.connected() {
+	if !e.EndpointState().connected() {
 		return tcpip.FullAddress{}, tcpip.ErrNotConnected
 	}
 
@@ -1799,34 +1828,10 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error) {
 // HandlePacket is called by the stack when new packets arrive to this transport
 // endpoint.
 func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, vv buffer.VectorisedView) {
-	s := newSegment(r, id, vv)
-	if !s.parse() {
-		e.stack.Stats().MalformedRcvdPackets.Increment()
-		e.stack.Stats().TCP.InvalidSegmentsReceived.Increment()
-		s.decRef()
-		return
-	}
-
-	if !s.csumValid {
-		e.stack.Stats().MalformedRcvdPackets.Increment()
-		e.stack.Stats().TCP.ChecksumErrors.Increment()
-		s.decRef()
-		return
-	}
-
-	e.stack.Stats().TCP.ValidSegmentsReceived.Increment()
-	if (s.flags & header.TCPFlagRst) != 0 {
-		e.stack.Stats().TCP.ResetsReceived.Increment()
-	}
-
-	// Send packet to worker goroutine.
-	if e.segmentQueue.enqueue(s) {
-		e.newSegmentWaker.Assert()
-	} else {
-		// The queue is full, so we drop the segment.
-		e.stack.Stats().DroppedPackets.Increment()
-		s.decRef()
-	}
+	// TCP HandlePacket is not required anymore as inbound packets first
+	// land at the Dispatcher which then can either delivery using the
+	// worker go routine or directly do the invoke the tcp processing inline
+	// based on the state of the endpoint.
 }
 
 // HandleControlPacket implements stack.TransportEndpoint.HandleControlPacket.
@@ -2144,9 +2149,7 @@ func (e *endpoint) initGSO() {
 // State implements tcpip.Endpoint.State. It exports the endpoint's protocol
 // state for diagnostics.
 func (e *endpoint) State() uint32 {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return uint32(e.state)
+	return uint32(e.EndpointState())
 }
 
 func mssForRoute(r *stack.Route) uint16 {

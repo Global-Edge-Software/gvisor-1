@@ -129,11 +129,7 @@ func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	}
 
 	if e.Capabilities == nil {
-		// enableRaw is set to true to prevent the filtering out of
-		// CAP_NET_RAW. This is the opposite of Create() because exec
-		// requires the capability to be set explicitly, while 'docker
-		// run' sets it by default.
-		e.Capabilities, err = specutils.Capabilities(true /* enableRaw */, c.Spec.Process.Capabilities)
+		e.Capabilities, err = specutils.Capabilities(conf.EnableRaw, c.Spec.Process.Capabilities)
 		if err != nil {
 			Fatalf("creating capabilities: %v", err)
 		}

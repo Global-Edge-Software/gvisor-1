@@ -1243,3 +1243,9 @@ func (s *Stack) SetICMPBurst(burst int) {
 func (s *Stack) AllowICMPMessage() bool {
 	return s.icmpRateLimiter.Allow()
 }
+
+// SetTCPTimeWaitTimeout sets the maximum amount of time a socket stays
+// in the TimeWait state before being closed.
+func (s *Stack) SetTCPTimeWaitTimeout(timeout time.Duration) {
+
+}
